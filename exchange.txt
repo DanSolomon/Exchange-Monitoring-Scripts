@@ -1,0 +1,255 @@
+Add-PsSnapin Microsoft.Exchange.Management.Powershell.E2010
+
+$logFilePath = "C:\temp\ExchangeMontioring.log"
+$maxLogFileSizeInKB = 400
+$minExchangeDBHDFreeSpaceInGB = 20
+$minLogHDFreeSpaceInGB = 100
+$minRootHDFreeSpaceInGB = 5
+$emailFromContact = "exchangemonitor@test.email.address"
+$emailToContact = "admin@test.email.address"
+$emailSubject = "Exchange Mailbox Status Report"
+
+#Writes the given log with the given results
+#Logs will be no larger than 400KB and no older than 30 days
+#Keeps the 1 previous log file stored as $FilePath.old
+function writeLog {
+ param($FilePath, $SummaryLog, $VerboseLog)
+
+ $file = get-item $FilePath
+ #Create new log file if:
+ #  the log file doesn't exist
+ #  the log file is greater than 400Kb
+ #  the log file is older than 30 days old
+ if(!$file -or (($file.length / 1Kb) -gt 30) -or 
+  ($file.creationTime -lt [DateTime]::Now.addDays(-30))) {
+    $oldFile = get-item "$FilePath.old"
+    #Delete old log files if they exist
+    if($oldFile) {
+      remove-item $oldFile
+    }
+    #Backup current log file if it exists
+    if($file) {
+      rename-item $file "$FilePath.old"
+    }
+    #Create new current log file
+    $file = new-item $FilePath -type file -force
+  }
+  
+  #Append timestamp to log
+  add-content $file "**********************************************************"
+  add-content $file "Results generated: $([DateTime]::Now)"
+  add-content $file "**********************************************************"
+  
+  #Append results to log
+  #Note we must replace the newlines in the string with a carriage return and a 
+  #newline in order to format correctly for windows text files
+  add-content $file ($SummaryLog -replace '\n', "`r`n")
+  add-content $file ($VerboseLog -replace '\n', "`r`n")
+}
+
+#Sends an HTML email
+function sendMail {
+  param($fromContact, $toContact, $subject, $message)
+
+  Write-Host "Sending Email"
+
+  #SMTP server name
+  $smtpServer = "smtp.mail.server"
+
+  #Creating a Mail object
+  $msg = new-object Net.Mail.MailMessage
+
+  #Creating SMTP server object
+  $smtp = new-object Net.Mail.SmtpClient($smtpServer)
+
+  #Set-up Email structure 
+  $msg.From = $fromContact
+  $msg.ReplyTo = $fromContact
+  $msg.To.Add($toContact)
+  $msg.subject = $subject
+  $msg.body = $message
+  $msg.IsBodyHTML = $true
+  #Send email 
+  $smtp.Send($msg)
+}
+
+#Get the computer name
+get-content env:COMPUTERNAME | Tee-Object -variable computerName
+$computerName = $computerName.ToUpper()
+
+#Set-up output buffers
+#Stores a summary of the results of each test in plaintext
+$summaryOutputText = "===Summary=================================`n"
+#Stores a summary of the results of each test in formatted HTML
+$summaryOutputHTML = "<fieldset> <legend>Summary</legend> "
+#Store the commands run and full results for each test in plaintext
+$verboseOutputText = "===Verbose=================================`n"
+#Store the commands run and full results for each test in formatted HTML
+$verboseOutputHTML = "<fieldset> <legend>Verbose</legend> <dl>"
+
+$summaryOutputHTML += "<ul>"
+
+################################################################################
+##  Database Copy Status                                                       #
+################################################################################
+
+Write-Host "Checking Database Copy Status"
+
+$summaryOutputText += "Database Copy Status: `n"
+$summaryOutputHTML += "<li>Database Copy Status: <ul>"
+
+$verboseOutputText += "EXCHANGESERVER00&01> Get-MailboxDatabaseCopyStatus `n"
+$verboseOutputHTML += "<dt style=`"color: white; background-color: #002452`">EXCHANGESERVER01&gt Get-MailboxDatabaseCopyStatus</dt>"
+#Check Mailbox Database Copy Status (EXCHANGESERVER00)
+$summaryOutputText += "`tBOTH: "
+$summaryOutputHTML += "<li>BOTH: "
+#Initialize replication health variables
+$replicationPassed = $False
+$replicationErrOut = ""
+$replicationverboseOutput = ""
+#Run and parse replication health results 
+$replicationTestResult = Get-MailboxDatabaseCopyStatus Database*\exchangeserver0*
+$replicationTestResult | foreach {
+    if(!$_.result.tostring().Equals("Passed")) {
+        $replicationErrOut += "$_`n"
+    }
+    $replicationverboseOutput += "$($_.tostring())`n"
+}
+
+if(!$replicationErrOut) {
+  $replicationPassed = $True
+}
+
+#Output result for current mailbox (EXCHANGESERVER00)
+if($replicationPassed) {
+  $summaryOutputText += "Passed"
+  $summaryOutputHTML += "<strong style=`"color: green`">Passed</strong>"
+} else {
+  $summaryOutputText += "Failed"
+  $summaryOutputHTML += "<strong style=`"color: red`">Failed</strong>"
+
+  $summaryOutputText += "`t$replicationErrOut`n"
+  $summaryOutputHTML += "<pre>$replicationErrOut</pre>"
+}
+
+$verboseOutputText += "$($replicationTestResult | out-string)`n"
+$verboseOutputHTML += "<dd><pre>$($replicationTestResult | out-string)</pre></dd>"
+
+$summaryOutputHTML += "</ul></li>"
+
+
+################################################################################
+##  Backup Checks       				                       #
+################################################################################
+Write-Host "Checking Backup Results"
+
+$summaryOutputText += "Backup Check: `n"
+$summaryOutputHTML += "<li>Backup Check: "
+
+$verboseOutputText += "EXCHANGESERVER00&01> TSM Backup Status `n"
+$verboseOutputHTML += "<dt style=`"color: white; background-color: #002452`">EXCHANGE&gt Backup Status</dt>"
+
+#Stuff for Exchangeserver00
+$dir = "C:\Program Files\Backup\results"
+$latest = Get-ChildItem -Path $dir | Sort-Object LastAccessTime -Descending | Select-Object -First 1
+$file = $latest.name
+$fcmResultExchangeServer00 = Get-Content $dir\$file
+$tsmResultExchangeServer00 = Get-Content "C:\Program Files\Backup\tdpexc.log" | Select-Object -last 55
+$eventlogExchangeServer00 = Get-EventLog "Application" -After (Get-Date).AddHours(-24) | Where-Object {$_.EventID -eq 1002} | Where-Object {$_.Source -eq "BackupExchange"}
+
+#Stuff for Exchangeserver01
+$dir = "\\exchange01\c$\Program Files\Backup\results"
+$latest = Get-ChildItem -Path $dir | Sort-Object LastAccessTime -Descending | Select-Object -First 1
+$file = $latest.name
+$backupResultExchangeServer01 = Get-Content $dir\$file
+$backupResultExchangeServer01 = Get-Content "\\exchangeserver01\c$\Program Files\Backup\tdpexc.log" | Select-Object -last 55
+$eventlogExchangeServer01 = Get-EventLog "Application" -ComputerName "exchangeserver01" -After (Get-Date).AddHours(-24) | Where-Object {$_.EventID -eq 1002} | Where-Object {$_.Source -eq "BackupExchange"}
+
+$passed = "fail"
+if ($fcmResultExchangeServer00 -Match "if 0 NEQ 0 set rc=0") {
+	if ($tsmResultExchangeServer00 -Match "VSS Backup operation completed with rc = 0") {
+		if ($eventlogExchangeServer00.Message -Match "Backup completed with rc") {
+			$passed = "exchangeserver00"
+		}
+	}
+} else {
+	if ($fcmResultExchangeServer01 -Match "if 0 NEQ 0 set rc=0") {
+		if ($tsmResultExchangeServer01 -Match "VSS Backup operation completed with rc = 0") {
+			if ($eventlogExchangeServer01.Message -Match "Backup completed with rc") {
+				$passed = "exchangeserver01"
+			}
+		}
+	}
+}
+
+if ($passed -Match "exchange") {
+  $summaryOutputText += "Passed ($passed)"
+  $summaryOutputHTML += "<strong style=`"color: green`">Passed ($passed)</strong>"
+} else {
+  $summaryOutputText += "Failed"
+  $summaryOutputHTML += "<strong style=`"color: red`">Failed</strong>"
+}
+
+$verboseOutputHTML += "<b><dd><pre>$("------------------------------------------------------------------------" | out-string)</pre></dd>"
+$verboseOutputHTML += "<dd><pre>$("-------------Flash Copy Manager Results (exchangeserver00)--------------" | out-string)</pre></dd>"
+$verboseOutputHTML += "<dd><pre>$("------------------------------------------------------------------------" | out-string)</pre></dd></b>"
+$verboseOutputHTML += "<dd><pre>$($backupResultExchangeServer00 | out-string)</pre></dd>"
+$verboseOutputHTML += "<b><dd><pre>$("-------------------------------------------------------------------------" | out-string)</pre></dd>"
+$verboseOutputHTML += "<dd><pre>$("---------------------TSM Results (exchangeserver00)---------------------" | out-string)</pre></dd>"
+$verboseOutputHTML += "<dd><pre>$("------------------------------------------------------------------------" | out-string)</pre></dd></b>"
+$verboseOutputHTML += "<dd><pre>$($backupResultExchangeServer00 | out-string)</pre></dd>"
+$verboseOutputHTML += "<b><dd><pre>$("------------------------------------------------------------------------" | out-string)</pre></dd>"
+$verboseOutputHTML += "<dd><pre>$("------------------Event Log Results (exchangeserver00)------------------" | out-string)</pre></dd>"
+$verboseOutputHTML += "<dd><pre>$("------------------------------------------------------------------" | out-string)</pre></dd></b>"
+$verboseOutputHTML += "<dd><pre>$($eventlogExchangeServer00 | out-string)</pre></dd>"
+
+$verboseOutputHTML += "<b><dd><pre>$("------------------------------------------------------------------------" | out-string)</pre></dd>"
+$verboseOutputHTML += "<dd><pre>$("-------------Flash Copy Manager Results (exchangeserver01)--------------" | out-string)</pre></dd>"
+$verboseOutputHTML += "<dd><pre>$("------------------------------------------------------------------------" | out-string)</pre></dd></b>"
+$verboseOutputHTML += "<dd><pre>$($fcmResultExchangeServer01 | out-string)</pre></dd>"
+$verboseOutputHTML += "<b><dd><pre>$("------------------------------------------------------------------------" | out-string)</pre></dd>"
+$verboseOutputHTML += "<dd><pre>$("---------------------TSM Results (exchangeserver01)---------------------" | out-string)</pre></dd>"
+$verboseOutputHTML += "<dd><pre>$("-------------------------------------------------------------------------" | out-string)</pre></dd></b>"
+$verboseOutputHTML += "<dd><pre>$($tsmResultExchangeServer01 | out-string)</pre></dd>"
+$verboseOutputHTML += "<b><dd><pre>$("------------------------------------------------------------------------" | out-string)</pre></dd>"
+$verboseOutputHTML += "<dd><pre>$("------------------Event Log Results (exchangeserver01)------------------" | out-string)</pre></dd>"
+$verboseOutputHTML += "<dd><pre>$("------------------------------------------------------------------------" | out-string)</pre></dd></b>"
+$verboseOutputHTML += "<dd><pre>$($eventlogExchangeServer01 | out-string)</pre></dd>"
+
+$summaryOutputHTML += "</li>"
+
+################################################################################
+##  Checks that both hosts are operational in the cluster                      #
+################################################################################
+Write-Host "Checking cluster status"
+#Write output
+$summaryOutputText += "Cluster Status: "
+$summaryOutputHTML += "<li>Cluster Status: "
+
+$verboseOutputText += "> Cluster Stuff`n"
+$verboseOutputHTML += "<dt style=`"color: white; background-color: #002452`">&gt Cluster Stuff</dt>"
+#Initialize replication health variables
+$clusterStatusPass = $False
+$clusterStatusErrOut = ""
+
+$clusterverboseOutput1 += Get-ClusterGroup
+$clusterverboseOutput2 += Get-ClusterNode
+
+#Output results of cluster status
+if($clusterStatusPass) {
+  $summaryOutputText += "Passed`n`n"
+  $summaryOutputHTML += "<strong style=`"color: green`">Passed</strong>"
+} else {
+  $summaryOutputText += "Still Working On"
+  $summaryOutputHTML += "<strong style=`"color: orange`">Still Working On</strong>"
+
+  $summaryOutputText += "$clusterStatusErrOut"
+  #$summaryOutputHTML += "<pre>$clusterStatusErrOut</pre>"
+}
+$summaryOutputHTML += "</li>"
+$verboseOutputText += "$($clusterverboseOutput1  | out-string)`n"
+$verboseOutputHTML += "<dd><pre>$($clusterverboseOutput1 | out-string)</pre></dd>"
+$verboseOutputText += "$($clusterverboseOutput2  | out-string)`n"
+$verboseOutputHTML += "<dd><pre>$($clusterverboseOutput2 | out-string)</pre></dd>"
+
+
